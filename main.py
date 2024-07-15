@@ -1,117 +1,111 @@
-import os, sys
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, OneCycleLR
 from torchmetrics import Accuracy
 import hydra
 from omegaconf import DictConfig
-import wandb
 from termcolor import cprint
 from tqdm import tqdm
 
-from src.datasets import ThingsMEGDataset
-from src.models import BasicConvClassifier
+from src.datasets import get_dataloaderscd
+from src.models import EnhancedWaveNet
 from src.utils import set_seed
 
+@hydra.main(version_base="1.1", config_path="configs", config_name="config")
+def main(cfg: DictConfig):
+    set_seed(cfg.seed)
 
-@hydra.main(version_base=None, config_path="configs", config_name="config")
-def run(args: DictConfig):
-    set_seed(args.seed)
-    logdir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    os.chdir(hydra.utils.get_original_cwd())
     
-    if args.use_wandb:
-        wandb.init(mode="online", dir=logdir, project="MEG-classification")
+    logdir = os.path.join(hydra.utils.get_original_cwd(), "outputs", hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
 
-    # ------------------
-    #    Dataloader
-    # ------------------
-    loader_args = {"batch_size": args.batch_size, "num_workers": args.num_workers}
+    print(f"Data directory: {cfg.data_dir}")
     
-    train_set = ThingsMEGDataset("train", args.data_dir)
-    train_loader = torch.utils.data.DataLoader(train_set, shuffle=True, **loader_args)
-    val_set = ThingsMEGDataset("val", args.data_dir)
-    val_loader = torch.utils.data.DataLoader(val_set, shuffle=False, **loader_args)
-    test_set = ThingsMEGDataset("test", args.data_dir)
-    test_loader = torch.utils.data.DataLoader(
-        test_set, shuffle=False, batch_size=args.batch_size, num_workers=args.num_workers
-    )
+    # デバッグフラグを設定
+    debug = False  # 必要に応じて True に変更
 
-    # ------------------
-    #       Model
-    # ------------------
-    model = BasicConvClassifier(
-        train_set.num_classes, train_set.seq_len, train_set.num_channels
-    ).to(args.device)
+    train_loader, val_loader, test_loader = get_dataloaders(cfg.data_dir, cfg.batch_size, cfg.num_workers, augment=True, debug=debug)
 
-    # ------------------
-    #     Optimizer
-    # ------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    num_channels = train_loader.dataset.num_channels
 
-    # ------------------
-    #   Start training
-    # ------------------  
+    model = EnhancedWaveNet(cfg.num_classes, num_subjects=10, num_channels=num_channels).to(cfg.device)
+    optimizer = Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+
+    if cfg.scheduler == 'plateau':
+        scheduler = ReduceLROnPlateau(optimizer, 'min')
+    elif cfg.scheduler == 'cosine':
+        scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs)
+    elif cfg.scheduler == 'onecycle':
+        scheduler = OneCycleLR(optimizer, max_lr=cfg.learning_rate, steps_per_epoch=len(train_loader), epochs=cfg.epochs)
+
     max_val_acc = 0
-    accuracy = Accuracy(
-        task="multiclass", num_classes=train_set.num_classes, top_k=10
-    ).to(args.device)
-      
-    for epoch in range(args.epochs):
-        print(f"Epoch {epoch+1}/{args.epochs}")
-        
-        train_loss, train_acc, val_loss, val_acc = [], [], [], []
-        
-        model.train()
-        for X, y, subject_idxs in tqdm(train_loader, desc="Train"):
-            X, y = X.to(args.device), y.to(args.device)
+    accuracy = Accuracy(task="multiclass", num_classes=1854, top_k=10).to(cfg.device)
+    early_stopping_counter = 0
+    patience = 5
 
-            y_pred = model(X)
-            
-            loss = F.cross_entropy(y_pred, y)
-            train_loss.append(loss.item())
-            
+    for epoch in range(cfg.epochs):
+        print(f"Epoch {epoch + 1}/{cfg.epochs}")
+        model.train()
+        train_loss, train_acc = [], []
+
+        for X, y, subject_idx in tqdm(train_loader):
+            X, y, subject_idx = X.to(cfg.device), y.to(cfg.device), subject_idx.to(cfg.device)
             optimizer.zero_grad()
+            y_pred = model(X, subject_idx)
+            loss = F.cross_entropy(y_pred, y)
             loss.backward()
             optimizer.step()
-            
-            acc = accuracy(y_pred, y)
-            train_acc.append(acc.item())
+
+            train_loss.append(loss.item())
+            train_acc.append(accuracy(y_pred, y).item())
 
         model.eval()
-        for X, y, subject_idxs in tqdm(val_loader, desc="Validation"):
-            X, y = X.to(args.device), y.to(args.device)
-            
+        val_loss, val_acc = [], []
+
+        for X, y, subject_idx in tqdm(val_loader):
+            X, y, subject_idx = X.to(cfg.device), y.to(cfg.device), subject_idx.to(cfg.device)
             with torch.no_grad():
-                y_pred = model(X)
-            
-            val_loss.append(F.cross_entropy(y_pred, y).item())
-            val_acc.append(accuracy(y_pred, y).item())
+                y_pred = model(X, subject_idx)
+                val_loss.append(F.cross_entropy(y_pred, y).item())
+                val_acc.append(accuracy(y_pred, y).item())
 
-        print(f"Epoch {epoch+1}/{args.epochs} | train loss: {np.mean(train_loss):.3f} | train acc: {np.mean(train_acc):.3f} | val loss: {np.mean(val_loss):.3f} | val acc: {np.mean(val_acc):.3f}")
-        torch.save(model.state_dict(), os.path.join(logdir, "model_last.pt"))
-        if args.use_wandb:
-            wandb.log({"train_loss": np.mean(train_loss), "train_acc": np.mean(train_acc), "val_loss": np.mean(val_loss), "val_acc": np.mean(val_acc)})
-        
-        if np.mean(val_acc) > max_val_acc:
-            cprint("New best.", "cyan")
-            torch.save(model.state_dict(), os.path.join(logdir, "model_best.pt"))
-            max_val_acc = np.mean(val_acc)
-            
-    
-    # ----------------------------------
-    #  Start evaluation with best model
-    # ----------------------------------
-    model.load_state_dict(torch.load(os.path.join(logdir, "model_best.pt"), map_location=args.device))
+        mean_train_loss = sum(train_loss) / len(train_loss)
+        mean_val_loss = sum(val_loss) / len(val_loss)
+        mean_train_acc = sum(train_acc) / len(train_acc)
+        mean_val_acc = sum(val_acc) / len(val_acc)
 
-    preds = [] 
+        if cfg.scheduler == 'plateau':
+            scheduler.step(mean_val_loss)
+        else:
+            scheduler.step()
+
+        print(f"Epoch {epoch + 1}/{cfg.epochs} | train loss: {mean_train_loss:.4f} | val loss: {mean_val_loss:.4f} | train acc: {mean_train_acc:.4f} | val acc: {mean_val_acc:.4f}")
+
+        if mean_val_acc > max_val_acc:
+            max_val_acc = mean_val_acc
+            early_stopping_counter = 0
+            torch.save(model.state_dict(), os.path.join(logdir, 'best_model.pth'))
+            cprint("New best model saved!", "green")
+        else:
+            early_stopping_counter += 1
+            if early_stopping_counter >= patience:
+                cprint("Early stopping triggered!", "red")
+                break
+
+    model.load_state_dict(torch.load(os.path.join(logdir, 'best_model.pth')))
     model.eval()
-    for X, subject_idxs in tqdm(test_loader, desc="Validation"):        
-        preds.append(model(X.to(args.device)).detach().cpu())
-        
-    preds = torch.cat(preds, dim=0).numpy()
-    np.save(os.path.join(logdir, "submission"), preds)
-    cprint(f"Submission {preds.shape} saved at {logdir}", "cyan")
+    preds = []
 
+    for X, subject_idx in tqdm(test_loader):
+        with torch.no_grad():
+            preds.append(model(X.to(cfg.device), subject_idx.to(cfg.device)).cpu())
+
+    preds = torch.cat(preds, dim=0).numpy()
+    np.save(os.path.join(logdir, 'test_preds.npy'), preds)
+    cprint(f"Test predictions saved to {logdir}", "cyan")
 
 if __name__ == "__main__":
-    run()
+    main()

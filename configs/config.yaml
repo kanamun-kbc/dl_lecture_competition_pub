@@ -1,13 +1,21 @@
-batch_size: 128
-epochs: 80
-lr: 0.001
-
+batch_size: 64
+epochs: 15
+learning_rate: 0.001
+weight_decay: 1e-4
 device: cuda:0
 num_workers: 4
 seed: 1234
 use_wandb: False
+data_dir: /workspace/dl_lecture_competition_pub/data
 
-data_dir: data
+# モデルのクラス数
+num_classes: 1854  # 追加
 
 # Evaluation
-model_path: 
+model_path:
+
+# Dropout rate
+p_drop: 0.5
+
+# Scheduler options
+scheduler: onecycle  # 'plateau', 'cosine', 'onecycle'
